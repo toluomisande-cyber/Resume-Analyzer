@@ -17,7 +17,7 @@ SYSTEM_PROMPT = (
     "When evidence is absent, make a recommendation and explicitly frame it as not detected in the resume. "
     "Compare the candidate to the selected career field at junior, mid-level, and senior expectations. "
     "Scores are reasoned estimates as whole numbers between 0 and 100 (e.g. junior: 45, mid: 70, senior: 85), not employment guarantees or official ATS scores. "
-    "Be thorough, concrete, and concise (1-2 clear sentences per bullet or description). "
+    "Be thorough, concrete, and concise (1 clear sentence per bullet or description, max 3-4 items per list so the output is compact). "
     "Return JSON only and adhere exactly to the requested schema."
 )
 
@@ -99,6 +99,7 @@ async def analyze_resume(resume: str, career: str) -> ResumeAnalysis:
     if not settings.openrouter_api_key:
         raise APIError(503, "AI_CONFIGURATION_ERROR", "AI service is not configured. Add OPENROUTER_API_KEY to backend/.env and restart the API.")
 
+    initial_max_tokens = min(settings.openrouter_max_tokens, 1800)
     payload = {
         "model": settings.openrouter_model,
         "messages": [
@@ -106,13 +107,31 @@ async def analyze_resume(resume: str, career: str) -> ResumeAnalysis:
             {"role": "user", "content": build_user_prompt(resume, career)}
         ],
         "temperature": 0.2,
-        "max_tokens": settings.openrouter_max_tokens,
+        "max_tokens": initial_max_tokens,
         "response_format": {"type": "json_object"}
     }
     headers = {"Authorization": f"Bearer {settings.openrouter_api_key}", "Content-Type": "application/json"}
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=15.0)) as client:
             response = await client.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload)
+
+            # Automatically recover if OpenRouter reports insufficient credits for the requested max_tokens
+            if response.status_code in (400, 402) or "fewer max_tokens" in response.text or "can only afford" in response.text:
+                afford_match = re.search(r"can only afford\s+(\d+)", response.text)
+                afforded = int(afford_match.group(1)) if afford_match else 1200
+                if afforded >= 650:
+                    retry_payload = {**payload, "max_tokens": max(600, afforded - 80)}
+                    logger.info(f"Retrying OpenRouter with reduced max_tokens={retry_payload['max_tokens']}")
+                    response = await client.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=retry_payload)
+                if response.status_code >= 400:
+                    free_payload = {
+                        "model": "openrouter/free",
+                        "messages": payload["messages"],
+                        "temperature": 0.2,
+                        "max_tokens": 1800,
+                    }
+                    logger.info("Falling back to openrouter/free due to credit limit")
+                    response = await client.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=free_payload)
     except httpx.TimeoutException as error:
         logger.error(f"AI request timed out: {error}")
         raise APIError(504, "AI_TIMEOUT", "The analysis took too long. Please try again.") from error
