@@ -12,30 +12,36 @@ logger = logging.getLogger(__name__)
 
 
 SYSTEM_PROMPT = (
-    "You are a meticulous resume reviewer. Analyze only the information in the resume. "
-    "Never invent employers, accomplishments, dates, metrics, certifications, or skills. "
-    "When evidence is absent, make a recommendation and explicitly frame it as not detected in the resume. "
-    "Compare the candidate to the selected career field at junior, mid-level, and senior expectations. "
-    "Scores are reasoned estimates as whole numbers between 0 and 100 (e.g. junior: 45, mid: 70, senior: 85), not employment guarantees or official ATS scores. "
-    "Be thorough, concrete, and concise (1 clear sentence per bullet or description, max 3-4 items per list so the output is compact). "
-    "Return raw valid JSON only (no markdown code fences) and adhere exactly to the requested schema."
+    "You are an expert technical hiring manager and senior resume reviewer. "
+    "Analyze ONLY the concrete evidence present in the candidate's resume—never invent employers, projects, dates, metrics, certifications, or skills.\n\n"
+    "STRICT CAREER-LEVEL SCORING RUBRIC (CRITICAL):\n"
+    "- You are scoring this single resume against three progressively harder hiring bars for the target career:\n"
+    "  1. `junior` (Low / Entry-Level Readiness, 0-100): Evaluates foundational skills, coursework, projects, internships, and entry-level readiness.\n"
+    "  2. `mid` (Mid-Level / Independent Contributor Readiness, 0-100): Evaluates 2-5 years of production ownership, end-to-end delivery, testing/deployment depth, and quantified impact. Because the Mid-Level bar is stricter than Junior, `mid` MUST ALWAYS be lower than `junior` (e.g., 12-25 points lower).\n"
+    "  3. `senior` (High-Level / Senior & Leadership Readiness, 0-100): Evaluates 5+ years of system architecture at scale, technical leadership, mentorship, and business-level strategy. Because the Senior bar is the hardest to meet, `senior` MUST ALWAYS be the lowest score (`junior > mid > senior`, e.g., junior: 82, mid: 58, senior: 32).\n"
+    "- NEVER make `senior` higher than `mid` or `mid` higher than `junior`.\n\n"
+    "RESUME-GROUNDED RECOMMENDATIONS & PROJECTS (CRITICAL):\n"
+    "- Every strength, improvement, and recommendation MUST directly reference specific projects, roles, tools, or bullet points that you actually read on the candidate's resume.\n"
+    "- In `skills.recommended`, ONLY suggest high-impact skills for the target career that are genuinely missing from the resume (never repeat skills already in `skills.detected`).\n"
+    "- In `projects`, check what projects the candidate has ALREADY built on their resume first. NEVER recommend a project they have already built. Instead, recommend new, next-level portfolio projects that build on their existing stack while filling the exact gaps blocking them from Mid-Level or Senior readiness, and explicitly mention in `description` how it advances beyond what is currently on their resume.\n"
+    "- Be specific, concrete, and concise (1-2 sharp sentences per item, 3-4 items per list). Return raw valid JSON only (no markdown code fences)."
 )
 
 
 def build_user_prompt(resume: str, career: str) -> str:
     schema = """{
   "career_field": "target career",
-  "scores": {"junior": 0, "mid": 0, "senior": 0},
-  "summary": "concise, evidence-based overall assessment",
-  "strengths": ["supported strength"],
-  "improvements": ["specific career-targeted improvement"],
-  "skills": {"detected": ["skill explicitly present"], "recommended": ["relevant skill not detected in the resume"]},
-  "projects": [{"title": "realistic project", "description": "why it fits candidate", "skills": ["skill"]}],
-  "experience": {"overview": "evidence-based overview", "strong_points": ["supported point"], "weak_points": ["gap or unclear area"], "suggestions": ["actionable suggestion"], "bullet_insights": [{"current": "quoted bullet", "assessment": "evaluation", "suggestion": "rewrite guidance"}]},
-  "education": {"overview": "evidence-based", "relevance": "relevance to target career", "recommendations": ["actionable recommendation"]},
-  "ats_analysis": {"overview": "ATS-style observation", "section_headings": ["observation"], "keyword_alignment": "evidence-based", "readability": "evidence-based", "parsing_notes": ["observation"], "recommendations": ["actionable recommendation"]}
+  "scores": {"junior": 82, "mid": 58, "senior": 32},
+  "summary": "specific assessment citing the candidate's actual background and explaining why they score as they do across Junior, Mid-level, and Senior bars",
+  "strengths": ["specific strength citing actual project, role, or skill from the resume"],
+  "improvements": ["specific improvement tailored to what is missing on this resume for the target career"],
+  "skills": {"detected": ["skill explicitly present in resume"], "recommended": ["missing skill not yet on the resume"]},
+  "projects": [{"title": "new project NOT already on the resume", "description": "why this project bridges the gap between the candidate's current resume projects/skills and Mid/Senior expectations", "skills": ["missing or advanced skill to demonstrate"]}],
+  "experience": {"overview": "evidence-based evaluation of work/project experience across Junior, Mid, and Senior expectations", "strong_points": ["specific supported point from resume"], "weak_points": ["specific gap preventing higher Mid/Senior score"], "suggestions": ["tailored next step based on their current experience"], "bullet_insights": [{"current": "exact quoted bullet from resume", "assessment": "what works and what is missing", "suggestion": "concrete stronger rewrite"}]},
+  "education": {"overview": "evidence-based summary of their actual education/certifications", "relevance": "how their specific background aligns with the target career", "recommendations": ["specific certification, coursework, or proof-of-work not yet on the resume"]},
+  "ats_analysis": {"overview": "specific ATS evaluation of this resume's structure and keywords", "section_headings": ["headings detected or missing"], "keyword_alignment": "how well the resume's actual keywords match the target career", "readability": "assessment of bullet density, action verbs, and metric usage", "parsing_notes": ["specific formatting/parsing observation"], "recommendations": ["concrete ATS improvement for this resume"]}
 }"""
-    return f"Target career: {career}\n\nReturn one JSON object with this exact shape:\n{schema}\n\nResume:\n---\n{resume}\n---"
+    return f"Target career: {career}\n\nRemember: enforce `scores.junior > scores.mid > scores.senior`, cite specific details from the resume, and never recommend projects or skills the candidate already has on their resume.\n\nReturn one JSON object with this exact shape:\n{schema}\n\nResume:\n---\n{resume}\n---"
 
 
 def _repair_truncated_json(raw: str) -> dict | None:
@@ -195,6 +201,13 @@ async def analyze_resume(resume: str, career: str) -> ResumeAnalysis:
                     content = choice if isinstance(choice, str) else "".join(item.get("text", "") for item in (choice or []))
                     parsed_data = clean_and_parse_json(content)
                     analysis = ResumeAnalysis.model_validate(parsed_data)
+                    resume_lower = resume.lower()
+                    filtered_projects = [
+                        p for p in analysis.projects
+                        if len(p.title.strip()) < 5 or p.title.strip().lower() not in resume_lower
+                    ]
+                    if filtered_projects:
+                        analysis = analysis.model_copy(update={"projects": filtered_projects})
                     return analysis.model_copy(update={"career_field": career})
                 except Exception as parse_err:
                     last_error = parse_err

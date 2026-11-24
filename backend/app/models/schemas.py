@@ -1,7 +1,7 @@
 import re
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class APIErrorBody(BaseModel):
@@ -44,6 +44,20 @@ class Scores(BaseModel):
             return max(0, min(100, int(round(num))))
         return 50
 
+    @model_validator(mode="after")
+    def enforce_level_hierarchy(self) -> "Scores":
+        # Readiness against progressively stricter bars must satisfy: junior >= mid >= senior
+        ordered = sorted([self.junior, self.mid, self.senior], reverse=True)
+        self.junior, self.mid, self.senior = ordered[0], ordered[1], ordered[2]
+        # Ensure meaningful separation if the model returned identical scores across tiers
+        if self.junior == self.mid and self.mid > 10:
+            self.mid = max(0, self.junior - 12)
+        if self.mid == self.senior and self.senior > 10:
+            self.senior = max(0, self.mid - 15)
+        elif self.senior > self.mid:
+            self.senior = max(0, self.mid - 10)
+        return self
+
 
 class SkillsAnalysis(BaseModel):
     detected: list[str] = Field(default_factory=list)
@@ -57,6 +71,14 @@ class SkillsAnalysis(BaseModel):
         if isinstance(value, str) and value.strip():
             return [s.strip() for s in value.split(",") if s.strip()]
         return []
+
+    @model_validator(mode="after")
+    def deduplicate_recommended_against_detected(self) -> "SkillsAnalysis":
+        detected_lower = {s.lower() for s in self.detected}
+        self.recommended = [
+            s for s in self.recommended if s.lower() not in detected_lower
+        ]
+        return self
 
 
 class ProjectRecommendation(BaseModel):
