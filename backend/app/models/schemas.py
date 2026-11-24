@@ -205,6 +205,19 @@ class ResumeAnalysis(BaseModel):
             return [value.strip()]
         return []
 
+    @field_validator("projects", mode="before")
+    @classmethod
+    def sanitize_projects(cls, value: Any) -> list[Any]:
+        if not isinstance(value, list):
+            return []
+        cleaned = []
+        for item in value:
+            if isinstance(item, dict):
+                cleaned.append(item)
+            elif isinstance(item, str) and item.strip():
+                cleaned.append({"title": item.strip(), "description": "", "skills": []})
+        return cleaned
+
 
 class SuccessResponse(BaseModel):
     success: bool = True

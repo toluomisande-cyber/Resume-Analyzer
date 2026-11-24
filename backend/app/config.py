@@ -11,8 +11,8 @@ load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=True)
 @dataclass(frozen=True)
 class Settings:
     openrouter_api_key: str = os.getenv("OPENROUTER_API_KEY", "")
-    openrouter_model: str = os.getenv("OPENROUTER_MODEL", "google/gemini-2.5-flash")
-    openrouter_max_tokens: int = int(os.getenv("OPENROUTER_MAX_TOKENS", "1800"))
+    openrouter_model: str = os.getenv("OPENROUTER_MODEL", "google/gemini-2.5-flash-lite")
+    openrouter_max_tokens: int = int(os.getenv("OPENROUTER_MAX_TOKENS", "2400"))
     frontend_url: str = os.getenv("FRONTEND_URL", "http://localhost:3000")
     max_upload_bytes: int = 5 * 1024 * 1024
     max_resume_characters: int = 100_000

@@ -18,24 +18,79 @@ SYSTEM_PROMPT = (
     "Compare the candidate to the selected career field at junior, mid-level, and senior expectations. "
     "Scores are reasoned estimates as whole numbers between 0 and 100 (e.g. junior: 45, mid: 70, senior: 85), not employment guarantees or official ATS scores. "
     "Be thorough, concrete, and concise (1 clear sentence per bullet or description, max 3-4 items per list so the output is compact). "
-    "Return JSON only and adhere exactly to the requested schema."
+    "Return raw valid JSON only (no markdown code fences) and adhere exactly to the requested schema."
 )
 
 
 def build_user_prompt(resume: str, career: str) -> str:
     schema = """{
-  \"career_field\": \"target career\",
-  \"scores\": {\"junior\": 0, \"mid\": 0, \"senior\": 0},
-  \"summary\": \"concise, evidence-based overall assessment\",
-  \"strengths\": [\"supported strength\"],
-  \"improvements\": [\"specific career-targeted improvement\"],
-  \"skills\": {\"detected\": [\"skill explicitly present\"], \"recommended\": [\"relevant skill not detected in the resume\"]},
-  \"projects\": [{\"title\": \"realistic project\", \"description\": \"why it fits candidate\", \"skills\": [\"skill\"]}],
-  \"experience\": {\"overview\": \"evidence-based overview\", \"strong_points\": [\"supported point\"], \"weak_points\": [\"gap or unclear area\"], \"suggestions\": [\"actionable suggestion\"], \"bullet_insights\": [{\"current\": \"quoted bullet\", \"assessment\": \"evaluation\", \"suggestion\": \"rewrite guidance\"}]},
-  \"education\": {\"overview\": \"evidence-based\", \"relevance\": \"relevance to target career\", \"recommendations\": [\"actionable recommendation\"]},
-  \"ats_analysis\": {\"overview\": \"ATS-style observation\", \"section_headings\": [\"observation\"], \"keyword_alignment\": \"evidence-based\", \"readability\": \"evidence-based\", \"parsing_notes\": [\"observation\"], \"recommendations\": [\"actionable recommendation\"]}
+  "career_field": "target career",
+  "scores": {"junior": 0, "mid": 0, "senior": 0},
+  "summary": "concise, evidence-based overall assessment",
+  "strengths": ["supported strength"],
+  "improvements": ["specific career-targeted improvement"],
+  "skills": {"detected": ["skill explicitly present"], "recommended": ["relevant skill not detected in the resume"]},
+  "projects": [{"title": "realistic project", "description": "why it fits candidate", "skills": ["skill"]}],
+  "experience": {"overview": "evidence-based overview", "strong_points": ["supported point"], "weak_points": ["gap or unclear area"], "suggestions": ["actionable suggestion"], "bullet_insights": [{"current": "quoted bullet", "assessment": "evaluation", "suggestion": "rewrite guidance"}]},
+  "education": {"overview": "evidence-based", "relevance": "relevance to target career", "recommendations": ["actionable recommendation"]},
+  "ats_analysis": {"overview": "ATS-style observation", "section_headings": ["observation"], "keyword_alignment": "evidence-based", "readability": "evidence-based", "parsing_notes": ["observation"], "recommendations": ["actionable recommendation"]}
 }"""
     return f"Target career: {career}\n\nReturn one JSON object with this exact shape:\n{schema}\n\nResume:\n---\n{resume}\n---"
+
+
+def _repair_truncated_json(raw: str) -> dict | None:
+    start = raw.find("{")
+    if start == -1:
+        return None
+    s = raw[start:].strip()
+
+    # Try progressively trimming from the end at safe structural boundaries
+    for cut in range(len(s), max(2, len(s) - 600), -1):
+        prefix = s[:cut].rstrip()
+        if not prefix:
+            break
+
+        # Track open strings and brackets using a stack
+        in_str = False
+        esc = False
+        stack: list[str] = []
+        for ch in prefix:
+            if esc:
+                esc = False
+                continue
+            if ch == "\\":
+                esc = True
+                continue
+            if ch == '"':
+                in_str = not in_str
+                continue
+            if not in_str:
+                if ch == "{":
+                    stack.append("}")
+                elif ch == "[":
+                    stack.append("]")
+                elif ch in ("}", "]") and stack and stack[-1] == ch:
+                    stack.pop()
+
+        candidate = prefix
+        if in_str:
+            candidate += '"'
+        candidate = re.sub(r"[,:\s]+$", "", candidate)
+        # If it ends with a dangling object key like {..., "key" without a colon, fill ": null"
+        if stack and stack[-1] == "}" and re.search(r'(?:[{,])\s*"[^"\\]*"$', candidate):
+            candidate += ": null"
+        elif re.search(r":\s*$", prefix):
+            candidate += " null"
+
+        candidate += "".join(reversed(stack))
+        candidate = re.sub(r",\s*([}\]])", r"\1", candidate)
+        try:
+            parsed = json.loads(candidate, strict=False)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            continue
+    return None
 
 
 def clean_and_parse_json(content: str) -> dict:
@@ -76,21 +131,10 @@ def clean_and_parse_json(content: str) -> dict:
         except json.JSONDecodeError:
             pass
 
-    # 5. Handle partially truncated JSON (repair open strings and brackets)
-    if start != -1:
-        truncated = text[start:].strip()
-        truncated = re.sub(r",\s*$", "", truncated)
-        open_quotes = truncated.count('"') - truncated.count('\\"')
-        if open_quotes % 2 != 0:
-            truncated += '"'
-        open_curlies = truncated.count("{") - truncated.count("}")
-        open_squares = truncated.count("[") - truncated.count("]")
-        truncated += ("]" * max(0, open_squares)) + ("}" * max(0, open_curlies))
-        truncated = re.sub(r",\s*([}\]])", r"\1", truncated)
-        try:
-            return json.loads(truncated, strict=False)
-        except json.JSONDecodeError:
-            pass
+    # 5. Stack-based repair for partially truncated JSON
+    repaired = _repair_truncated_json(text)
+    if repaired is not None:
+        return repaired
 
     raise ValueError(f"Could not parse valid JSON from AI response: {text[:200]}")
 
@@ -99,39 +143,63 @@ async def analyze_resume(resume: str, career: str) -> ResumeAnalysis:
     if not settings.openrouter_api_key:
         raise APIError(503, "AI_CONFIGURATION_ERROR", "AI service is not configured. Add OPENROUTER_API_KEY to backend/.env and restart the API.")
 
-    initial_max_tokens = min(settings.openrouter_max_tokens, 1800)
-    payload = {
-        "model": settings.openrouter_model,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": build_user_prompt(resume, career)}
-        ],
-        "temperature": 0.2,
-        "max_tokens": initial_max_tokens,
-        "response_format": {"type": "json_object"}
-    }
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": build_user_prompt(resume, career)},
+    ]
+
+    # Prefer non-reasoning fast models first so max_tokens are never consumed by hidden thinking tokens
+    configured = settings.openrouter_model.strip()
+    if configured == "google/gemini-2.5-flash":
+        candidate_models = ["google/gemini-2.5-flash-lite", "openai/gpt-4o-mini", "google/gemini-2.5-flash"]
+    else:
+        candidate_models = [configured, "google/gemini-2.5-flash-lite", "openai/gpt-4o-mini"]
+
     headers = {"Authorization": f"Bearer {settings.openrouter_api_key}", "Content-Type": "application/json"}
+    last_error: Exception | None = None
+    last_response: httpx.Response | None = None
+
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=15.0)) as client:
-            response = await client.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload)
+            for model_name in dict.fromkeys(candidate_models):
+                payload = {
+                    "model": model_name,
+                    "messages": messages,
+                    "temperature": 0.2,
+                    "max_tokens": min(settings.openrouter_max_tokens, 2400),
+                    "response_format": {"type": "json_object"},
+                }
+                response = await client.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload)
+                last_response = response
 
-            # Automatically recover if OpenRouter reports insufficient credits for the requested max_tokens
-            if response.status_code in (400, 402) or "fewer max_tokens" in response.text or "can only afford" in response.text:
-                afford_match = re.search(r"can only afford\s+(\d+)", response.text)
-                afforded = int(afford_match.group(1)) if afford_match else 1200
-                if afforded >= 650:
-                    retry_payload = {**payload, "max_tokens": max(600, afforded - 80)}
-                    logger.info(f"Retrying OpenRouter with reduced max_tokens={retry_payload['max_tokens']}")
-                    response = await client.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=retry_payload)
+                if response.status_code in (400, 402) or "fewer max_tokens" in response.text or "can only afford" in response.text:
+                    afford_match = re.search(r"can only afford\s+(\d+)", response.text)
+                    if afford_match:
+                        afforded = int(afford_match.group(1))
+                        if afforded >= 1000:
+                            retry_payload = {**payload, "max_tokens": afforded - 50}
+                            response = await client.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=retry_payload)
+                            last_response = response
+
                 if response.status_code >= 400:
-                    free_payload = {
-                        "model": "openrouter/free",
-                        "messages": payload["messages"],
-                        "temperature": 0.2,
-                        "max_tokens": 1800,
-                    }
-                    logger.info("Falling back to openrouter/free due to credit limit")
-                    response = await client.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=free_payload)
+                    logger.warning(f"Model {model_name} returned {response.status_code}, trying next candidate...")
+                    continue
+
+                try:
+                    data = response.json()
+                    if isinstance(data, dict) and "error" in data:
+                        logger.warning(f"Model {model_name} returned error payload: {data['error']}")
+                        continue
+
+                    choice = data["choices"][0]["message"].get("content")
+                    content = choice if isinstance(choice, str) else "".join(item.get("text", "") for item in (choice or []))
+                    parsed_data = clean_and_parse_json(content)
+                    analysis = ResumeAnalysis.model_validate(parsed_data)
+                    return analysis.model_copy(update={"career_field": career})
+                except Exception as parse_err:
+                    last_error = parse_err
+                    logger.warning(f"Model {model_name} output failed JSON parse/validation ({parse_err}), trying next candidate...")
+                    continue
     except httpx.TimeoutException as error:
         logger.error(f"AI request timed out: {error}")
         raise APIError(504, "AI_TIMEOUT", "The analysis took too long. Please try again.") from error
@@ -139,46 +207,11 @@ async def analyze_resume(resume: str, career: str) -> ResumeAnalysis:
         logger.error(f"AI connection error: {error}")
         raise APIError(503, "AI_UNAVAILABLE", "We couldn't connect to the AI service right now. Please try again in a moment.") from error
 
-    if response.status_code == 429:
-        logger.warning("OpenRouter rate limit reached (429)")
+    if last_response is not None and last_response.status_code == 429:
         raise APIError(429, "AI_USAGE_UNAVAILABLE", "Model rate limit reached. Please wait a moment and try again.")
-    if response.status_code >= 400:
-        error_msg = "We couldn't connect to the AI service right now. Please try again in a moment."
-        try:
-            err_json = response.json()
-            if isinstance(err_json, dict) and "error" in err_json:
-                api_err = err_json["error"]
-                if isinstance(api_err, dict) and "message" in api_err:
-                    error_msg = api_err["message"]
-                elif isinstance(api_err, str):
-                    error_msg = api_err
-        except Exception:
-            pass
-        logger.error(f"OpenRouter returned status {response.status_code}: {error_msg}")
-        raise APIError(503, "AI_UNAVAILABLE", error_msg)
 
-    try:
-        data = response.json()
-        if isinstance(data, dict) and "error" in data:
-            err = data["error"]
-            err_msg = err.get("message", "AI provider returned an error") if isinstance(err, dict) else str(err)
-            logger.error(f"OpenRouter response contained error object: {err_msg}")
-            raise APIError(503, "AI_UNAVAILABLE", err_msg)
+    if last_error is not None:
+        logger.error(f"Failed to parse or validate AI response across candidates: {last_error}", exc_info=True)
+        raise APIError(502, "AI_RESPONSE_INVALID", "The AI returned an unreadable analysis. Please try again.") from last_error
 
-        choice = data["choices"][0]["message"]["content"]
-        content = choice if isinstance(choice, str) else "".join(item.get("text", "") for item in choice)
-        parsed_data = clean_and_parse_json(content)
-        analysis = ResumeAnalysis.model_validate(parsed_data)
-    except APIError:
-        raise
-    except Exception as error:
-        logger.error(f"Failed to parse or validate AI response: {error}", exc_info=True)
-        # Log snippet of response if available
-        try:
-            raw_preview = content[:500] if "content" in locals() else response.text[:500]
-            logger.error(f"Raw AI content preview: {raw_preview}")
-        except Exception:
-            pass
-        raise APIError(502, "AI_RESPONSE_INVALID", "The AI returned an unreadable analysis. Please try again.") from error
-
-    return analysis.model_copy(update={"career_field": career})
+    raise APIError(503, "AI_UNAVAILABLE", "We couldn't connect to the AI service right now. Please try again in a moment.")
